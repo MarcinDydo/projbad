@@ -65,7 +65,7 @@ class Model:
 
         X = freq_df.values
         logging.info(f"prepparing matrix for PyOD on column {col}:  each time bucket count becomes a sample. of {bucket_size}")
-        m = IForest(contamination=0.1, random_state=42)
+        m = IForest(contamination=0.2, random_state=42)
         m.fit(X)
         labels = m.predict(X)
         scores = m.decision_function(X)
@@ -103,20 +103,23 @@ def main():
         logging.info("Elasticsearch cluster is down!")
         return
     
-    if True: #TODO:argparse
+    if True: #TODO:argparse 
         logging.info("Runtime arguments not specified, defaults used..")
         index = "logs-*"
         query = {"term": {"event.dataset":"suricata.alert"}}
     
-
+    #TODO: implement cache
     logging.warning("Query-ing elasticsearch.")
     data = model.get_hits(index, query)
+    #THIS SHOULD BE PREPROCESSING
     model.df = get_dataframe(data)
     headers = model.entropy_filter()
+    if "@timestamp" in headers: headers.remove("@timestamp")
+    #long data should be tokenized 
     logging.warning("Performing Isolation Forest outlier detection")
     model.generate_query(headers, model.iforest_outliers)
     print(f"Search results + filter:{headers}")
 
-if __name__ == '__main__':
+if __name__ == '__main__': 
     load_dotenv()
     main()
