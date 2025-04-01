@@ -1,9 +1,65 @@
 import json
 from collections import defaultdict
 from datetime import datetime
+import logging
 import pandas as pd
 import numpy as np
+import ipaddress
+from skrub import StringEncoder
 
+def int_transform(series: pd.Series) -> np.ndarray:
+    """
+    Convert a numeric or numeric-like series to integers and return a 2D float array.
+    Any non-convertible values are coerced to NaN then filled with 0.
+    """
+    # Convert series to numeric (coerce errors), fill missing with 0, and cast to int
+    numeric_series = pd.to_numeric(series, errors='coerce').fillna(0).astype(int)
+    # Return as 2D array with float type
+    return numeric_series.values.reshape(-1, 1)
+
+def float_transform(series: pd.Series) -> np.ndarray:
+    """
+    Convert a series to floats and return a 2D array.
+    Non-numeric values are coerced to NaN and replaced with 0.0.
+    """
+    numeric_series = pd.to_numeric(series, errors='coerce').fillna(0.0).astype(float)
+    return numeric_series.values.reshape(-1, 1)
+
+def frequency_transform(series: pd.Series) -> np.ndarray:
+    """
+    series = series.astype(str)
+    dummies = pd.get_dummies(series, prefix=series.name)
+    # Convert to float and return the NumPy array
+    return dummies.values.astype(float)
+    """
+    freq = series.value_counts()
+    # Map each value in the original series to its frequency.
+    encoded_series = series.map(freq)
+    result = encoded_series.values.astype(float)
+    return result.reshape(-1, 1)
+
+def string_transform(series: pd.Series, maxN=30) -> np.ndarray:
+    n = len(series.value_counts())
+    if n > maxN: n = maxN
+    enc = StringEncoder(n_components=n)
+    series = series.fillna("").astype(str)
+    result = enc.fit_transform(series).values
+    return result
+
+def bagging_transform(df: pd.DataFrame, bucket_size='5s') -> np.ndarray:
+    # Ensure the DataFrame is indexed with a datetime index.
+    a =1
+    # Group by time bucket and the single column's values, then count occurrences.
+    pivot_df = df.groupby([pd.Grouper(freq=bucket_size), df]).size().unstack(fill_value=0)
+    b=3
+    return pivot_df.values.astype(float)
+
+def ensure_string_or_number(x):
+    # If x is an int, float, or str, keep it as is.
+    if isinstance(x, (int, float, str)):
+        return x
+    # Otherwise, convert it to a string representation.
+    return str(x)
 
 def flatten_dict(d, parent_key="", sep="."):
     """
@@ -94,3 +150,39 @@ def get_top_common_from_column(series, top_n=1):
     # Extract the top_n most common values as a list of (value, count) tuples.
     top_common = series_clean.value_counts().head(top_n)
     return top_common
+
+
+def get_notsingles_from_column(series):
+    # Remove missing values
+    series_clean = series.dropna()
+    # Count the frequency of each value in the series
+    value_counts = series_clean.value_counts()
+    # Filter and return values that appear more than once
+    result = value_counts[value_counts > 1]
+    return result
+
+def entropy_filter(series,min=0,max=0.95) -> bool: 
+    s = series.astype(str)
+    norm_entropy = compute_normalized_entropy(s.dropna())
+    if min < norm_entropy < max:
+        return True
+    else:
+        logging.warning(f"series diqualified entropy: {norm_entropy}")
+        return False
+
+def extract_properties(properties, parent_key=""):
+    """
+    Recursively traverse a properties dict and return a flat dict with dot-separated keys and their types.
+    """
+    result = {}
+    for key, value in properties.items():
+        # Build the dot-separated property name.
+        full_key = f"{parent_key}.{key}" if parent_key else key
+        # If this field has a defined type, add it.
+        if "type" in value:
+            result[full_key] = value["type"]
+        # If the field has nested properties, traverse them recursively.
+        if "properties" in value:
+            nested = extract_properties(value["properties"], full_key)
+            result.update(nested)
+    return result
