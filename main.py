@@ -25,10 +25,11 @@ class Model:
             api_key=api_key,
             use_ssl=use_ssl,
             verify_certs=verify_certs,
-            timeout=280
+            timeout=10
         )
         self.mapping = {}
         self.slice = None
+        self.function_scores= None
     
     def get_hits(self, index: str, query: dict, size:int) -> list:
         all_hits = []
@@ -78,12 +79,27 @@ class Model:
         else:
             return None
         
-    def index_mapping(self, index):
-        es_mapping = self.elastic.indices.get_mapping(index)
+    def index_mapping(self, index, use_cache=False, file="./cache/mapping_cache.json"):     
+        if use_cache and os.path.exists(file):
+            # Load mapping from the cache file
+            with open(file, 'r') as f:
+                es_mapping = json.load(f)
+        else:
+            # Retrieve mapping from Elasticsearch
+            es_mapping = self.elastic.indices.get_mapping(index)
+            if use_cache:
+                # Ensure the cache directory exists
+                os.makedirs(os.path.dirname(file), exist_ok=True)
+                # Save the retrieved mapping to the cache file
+                with open(file, 'w') as f:
+                    json.dump(es_mapping, f)
+        
+        # Process the mapping to extract properties
         for _, mapping_info in es_mapping.items():
             index_mappings = mapping_info.get("mappings", {})
             properties = index_mappings.get("properties", {})
             extracted = extract_properties(properties)
+            # Merge the extracted properties with the existing mapping (using the | operator for dict merge)
             self.mapping = self.mapping | extracted
     
     def transform_slice(self, f=None):
@@ -94,7 +110,7 @@ class Model:
             'short': int_transform,
             'ip': frequency_transform,
             'double': float_transform,
-            'long': float_transform,
+            'long': log_transform,
             'object': string_transform,
             'match_only_text': string_transform,
             'scaled_float': float_transform,
@@ -107,7 +123,8 @@ class Model:
             'wildcard': frequency_transform,
             'float': float_transform,
             'integer': int_transform,
-            'time_keyword': bagging_transform
+            'time_keyword': bagging_transform,
+            'long_text': count_vectorizer_transform
         }
         for i in copy.columns:
             if isinstance(copy.index, pd.DatetimeIndex) and "@timestamp" not in copy.columns:
@@ -123,30 +140,63 @@ class Model:
     
     def generate_query(self,function):
         results = []
+        uniq_f = set()
         logging.info(f"Currently using {self.slice.columns} in query")
         outliers = function() #list of outliers from column
         for o in outliers:
-            res = {"key":self.slice.columns[0],"value":o,"support":self.calculate_kpi(o)}
-            print(f"possible filter (type {self.mapping[res['key']]} > {res['key']} : {res['value']}; support = {res['support']}%")
+            kpi = self.calculate_kpi(o)
+            res = {"key":self.slice.columns[0],"value":o,"support":kpi[0],"lift":kpi[1],"z_score":kpi[2],"frequency":kpi[3]}
+            uniq_f.add(kpi[3])
+            #print(f"possible filter (type {self.mapping[res['key']]} > {res['key']} : {res['value']}; \
+            #      frequency = {res['frequency']}, support = {res['support']}%, lift={res['lift']}, z_score = {res['z_score']}")
             results.append(res)
+
+        for u in uniq_f:
+            l=[]
+            m=[]
+            for d in results:
+                if d.get("frequency") == u:
+                    m = [d["support"],d["lift"],d["z_score"],d["frequency"]]
+                    l.append(d["value"])
+            print(f"FILTER: type: {self.mapping[self.slice.columns[0]]} > {self.slice.columns[0]}: {str(l)} > support = {m[0]}%, lift={m[1]}, z_score = {m[2]}, frequency = {m[3]}")
         # Generate a filename
         filename = datetime.now().strftime("%Y-%m-%d") + ".csv"
         filepath = os.path.join(os.path.join("cache", "output"), filename)
         with open(filepath, "a", newline="", encoding="utf-8") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=["key","value","support"])
+            writer = csv.DictWriter(csvfile, fieldnames=["key","value","support","lift","z_score","frequency"])
             if not os.path.isfile(filepath):
                 writer.writeheader()
             writer.writerows(results)
 
     def calculate_kpi(self, value):
         total_count = len(self.slice)
+        # Convert all values to string for consistency
         counts = self.slice.astype(str).value_counts()
-        
+
+        # Frequency is simply the count for this value
         count = counts.get(str(value), 0)
-        support_percentage = (count / total_count) * 100  # percentage of total occurrences
-        return support_percentage
-                
-   
+        frequency = count
+
+        # Support as a percentage of total occurrences
+        support_percentage = (count / total_count) * 100 if total_count > 0 else 0
+
+        # Calculate lift.
+        # Under a uniform baseline, expected probability = 1 / (number of unique values)
+        num_unique = len(counts)
+        if num_unique > 0 and total_count > 0:
+            observed_probability = count / total_count
+            expected_probability = 1 / num_unique
+            lift = observed_probability / expected_probability
+        else:
+            lift = 0
+
+        # Calculate z-score: (observed count - mean count) / standard deviation of counts
+        mean_count = counts.mean() if len(counts) > 0 else 0
+        std_count = counts.std() if len(counts) > 1 else 0
+        z_score = (count - mean_count) / std_count if std_count != 0 else 0
+
+        return support_percentage, lift, z_score, frequency
+
     def time_iforest(self):
         # Optionally, you can normalize or scale X here if needed
         X = self.transform_slice()
@@ -157,6 +207,7 @@ class Model:
         # Predict outliers: In PyOD, typically 1 indicates an outlier and 0 an inlier.
         labels = m.predict(X)
         scores = m.decision_function(X)
+        self.function_scores = scores
         
         # Identify indices of outliers
         outlier_indices = np.where(labels == 1)[0]
@@ -200,12 +251,6 @@ def main():
 
     model = Model(host, port, api_key)
 
-    if model.elastic.ping():
-        logging.info("Elasticsearch cluster is up!")
-    else:
-        logging.info("Elasticsearch cluster is down!")
-        return
-
     if True:  # TODO: argparse
         logging.info("Runtime arguments not specified, defaults used..")
         index = "logs-*"
@@ -228,8 +273,15 @@ def main():
             }
         }
         size = 50000
-
-    model.index_mapping(index)    #uniquemappings = set(model.mapping.values())
+    
+    if model.elastic.ping():
+        logging.info("Elasticsearch cluster is up!")
+        model.index_mapping(index)
+    else:
+        logging.warning("Elasticsearch cluster is down!")
+        model.index_mapping(index, use_cache=True)
+    
+    #uniquemappings = set(model.mapping.values())
     # Use cached data if available
     logging.warning(f"Loading hits to dataframe")
     cached_data = model.load_hits(query)
@@ -248,8 +300,11 @@ def main():
     headers.remove("@timestamp")
     logging.warning(f"Performing Isolation Forest outlier detection with headers: {headers}")
     for col in headers:
-        
-        if col =="rule.severity" or col =="event.severity":
+        if col =="network.data.decoded" or col == "rule.rule":
+            model.mapping[col] = 'long_text'
+            model.slice = df[[col]].copy()
+            model.generate_query(model.iforest)
+        elif col =="rule.severity" or col =="event.severity":
             model.slice = df[["@timestamp",col]].copy()#time slicing
             model.slice.set_index("@timestamp", inplace=True) 
             model.generate_query(model.time_iforest)

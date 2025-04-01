@@ -4,18 +4,33 @@ from datetime import datetime
 import logging
 import pandas as pd
 import numpy as np
-import ipaddress
+from sklearn.feature_extraction.text import CountVectorizer
 from skrub import StringEncoder
 
 def int_transform(series: pd.Series) -> np.ndarray:
-    """
-    Convert a numeric or numeric-like series to integers and return a 2D float array.
-    Any non-convertible values are coerced to NaN then filled with 0.
-    """
-    # Convert series to numeric (coerce errors), fill missing with 0, and cast to int
-    numeric_series = pd.to_numeric(series, errors='coerce').fillna(0).astype(int)
-    # Return as 2D array with float type
-    return numeric_series.values.reshape(-1, 1)
+    numeric_series = pd.to_numeric(series, errors='coerce').astype(float)
+    mean_val = numeric_series.mean()
+    numeric_series.fillna(mean_val)
+    std_val = numeric_series.std()
+    # Avoid division by zero: if std is 0, use 1 as the divisor.
+    if std_val == 0:
+        std_val = 1.0    
+    # Compute the z-score: how far each number is from the mean, scaled by std.
+    transformed = (numeric_series - mean_val) / std_val
+    # Return the transformed values as a 2D array of floats.
+    return transformed.values.reshape(-1, 1)
+
+def log_transform(series: pd.Series) -> np.ndarray:
+    # Convert series to numeric, handling non-numeric values as needed.
+    numeric_series = pd.to_numeric(series, errors='coerce').fillna(0).astype(float)
+    mean_val = numeric_series.mean()
+    transformed = (numeric_series - mean_val) /mean_val
+    # Apply the logarithmic transformation.
+    # np.log1p is used to handle zeros, as np.log1p(0)=0.
+    res = np.log1p(transformed)
+    
+    return res.values.reshape(-1, 1)
+
 
 def float_transform(series: pd.Series) -> np.ndarray:
     """
@@ -48,11 +63,23 @@ def string_transform(series: pd.Series, maxN=30) -> np.ndarray:
 
 def bagging_transform(df: pd.DataFrame, bucket_size='5s') -> np.ndarray:
     # Ensure the DataFrame is indexed with a datetime index.
-    a =1
     # Group by time bucket and the single column's values, then count occurrences.
     pivot_df = df.groupby([pd.Grouper(freq=bucket_size), df]).size().unstack(fill_value=0)
-    b=3
     return pivot_df.values.astype(float)
+
+def count_vectorizer_transform(series: pd.Series) -> np.ndarray:
+    # Ensure the series values are strings.
+    text_data = series.astype(str)
+    
+    # Initialize CountVectorizer with a token pattern that matches words with 4 or more characters.
+    vectorizer = CountVectorizer(token_pattern=r"(?u)\b\w{4,}\b")
+    
+    # Transform the text data to a document-term matrix.
+    dt_matrix = vectorizer.fit_transform(text_data)
+    
+    # Convert the sparse matrix to a dense numpy array and cast the data type to float.
+    res = dt_matrix.toarray().astype(float)
+    return res
 
 def ensure_string_or_number(x):
     # If x is an int, float, or str, keep it as is.
@@ -91,39 +118,6 @@ def get_dataframe(docs):
     df["@timestamp"] = pd.to_datetime(df["@timestamp"], errors="coerce")
     return(df)
 
-def sort_time(all_docs):
-    # 2) Group by 'key'
-    #    Store as: data_by_key[key] = [ (timestamp, value), ... ]
-    data_by_key = {}
-    for doc in all_docs:
-        source = doc.get("_source", {})
-        timestamp_str = source.get("@timestamp")
-        
-        if timestamp_str is None:
-            continue
-        try:
-            ts = datetime.fromisoformat(timestamp_str.replace("Z",""))
-        except ValueError:
-            continue
-        
-    sorted_docs = sorted(all_docs, key=lambda doc: doc["_source"]["@timestamp"])
-    return sorted_docs
-
-def round_to_bucket(dt, bucket_minutes=5):
-    """
-    Round a datetime 'dt' down to the nearest 'bucket_minutes'.
-    """
-    # Convert total minutes since midnight
-    total_minutes = dt.hour * 60 + dt.minute
-    # Floor to nearest bucket
-    floored = (total_minutes // bucket_minutes) * bucket_minutes
-
-    # Convert back to hours/minutes
-    new_hour = floored // 60
-    new_minute = floored % 60
-
-    return dt.replace(hour=new_hour, minute=new_minute, second=0, microsecond=0)
-
 def compute_entropy(series):
     #Shannon entropy of a pandas Series.
     counts = series.value_counts(normalize=True)
@@ -142,24 +136,6 @@ def compute_normalized_entropy(series):
     max_entropy = np.log2(n_unique)
     normalized_entropy = entropy / max_entropy
     return normalized_entropy
-
-def get_top_common_from_column(series, top_n=1):
-    series_clean = series.dropna()
-    value_counts = series_clean.value_counts()
-    
-    # Extract the top_n most common values as a list of (value, count) tuples.
-    top_common = series_clean.value_counts().head(top_n)
-    return top_common
-
-
-def get_notsingles_from_column(series):
-    # Remove missing values
-    series_clean = series.dropna()
-    # Count the frequency of each value in the series
-    value_counts = series_clean.value_counts()
-    # Filter and return values that appear more than once
-    result = value_counts[value_counts > 1]
-    return result
 
 def entropy_filter(series,min=0,max=0.95) -> bool: 
     s = series.astype(str)
