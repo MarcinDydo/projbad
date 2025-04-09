@@ -4,3 +4,5 @@ curl.txt
 __pycache__
 cache
 __pycache__/*
+test
+

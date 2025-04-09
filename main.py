@@ -30,6 +30,8 @@ class Model:
         self.mapping = {}
         self.slice = None
         self.function_scores= None
+        self.filename = None
+        self.filters = None
     
     def get_hits(self, index: str, query: dict, size:int) -> list:
         all_hits = []
@@ -110,7 +112,7 @@ class Model:
             'short': int_transform,
             'ip': frequency_transform,
             'double': float_transform,
-            'long': log_transform,
+            'long': frequency_transform,
             'object': string_transform,
             'match_only_text': string_transform,
             'scaled_float': float_transform,
@@ -123,7 +125,7 @@ class Model:
             'wildcard': frequency_transform,
             'float': float_transform,
             'integer': int_transform,
-            'time_keyword': bagging_transform,
+            'time_keyword': bucket_transform,
             'long_text': count_vectorizer_transform
         }
         for i in copy.columns:
@@ -135,14 +137,25 @@ class Model:
                 except KeyError:
                     type = 'keyword'
             f = switcher.get(type)
+            if f is None: f = frequency_transform
             tmp = copy[i].apply(ensure_string_or_number).dropna() #TODO:increase dimensions (now 1 pass only)
         return f(tmp)
     
-    def generate_query(self,function):
+    def generate_query(self,function,minf=3):
         results = []
         uniq_f = set()
         logging.info(f"Currently using {self.slice.columns} in query")
-        outliers = function() #list of outliers from column
+
+        counts = self.slice[self.slice.columns[0]].value_counts()
+        counts.index = counts.index.astype(str)
+        unique_values = set(counts[counts < minf].index)
+        duplicate_values = set(counts[counts >= minf].index)
+        outlier_set = function() #list of outliers from column as a SET
+        singular_outliers = list(outlier_set.intersection(unique_values))
+        outliers =list(outlier_set.intersection(duplicate_values))
+        if singular_outliers:
+            outliers.append(min(singular_outliers))
+            outliers.append(max(singular_outliers))
         for o in outliers:
             kpi = self.calculate_kpi(o)
             res = {"key":self.slice.columns[0],"value":o,"support":kpi[0],"lift":kpi[1],"z_score":kpi[2],"frequency":kpi[3]}
@@ -156,17 +169,17 @@ class Model:
             m=[]
             for d in results:
                 if d.get("frequency") == u:
-                    m = [d["support"],d["lift"],d["z_score"],d["frequency"]]
+                    m = [d["support"],d["lift"],d["z_score"],d["frequency"]] #lift is against equal distribution of uniq values
                     l.append(d["value"])
             print(f"FILTER: type: {self.mapping[self.slice.columns[0]]} > {self.slice.columns[0]}: {str(l)} > support = {m[0]}%, lift={m[1]}, z_score = {m[2]}, frequency = {m[3]}")
         # Generate a filename
-        filename = datetime.now().strftime("%Y-%m-%d") + ".csv"
-        filepath = os.path.join(os.path.join("cache", "output"), filename)
+        filepath = os.path.join(os.path.join("cache", "output"), self.filename)
         with open(filepath, "a", newline="", encoding="utf-8") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=["key","value","support","lift","z_score","frequency"])
             if not os.path.isfile(filepath):
                 writer.writeheader()
             writer.writerows(results)
+        self.filters = results
 
     def calculate_kpi(self, value):
         total_count = len(self.slice)
@@ -226,13 +239,14 @@ class Model:
             # Filter the original DataFrame for rows within the time span of this bucket
             mask = (self.slice.index >= bucket_start) & (self.slice.index < bucket_end)
             results.update(self.slice.loc[mask, self.slice.columns[0]].unique().tolist())
-        return list(map(str, results))
+        
+        return set(map(str, results))
     
     def iforest(self):
         # Optionally, you can normalize or scale X here if needed
         X = self.transform_slice()
         # Initialize and fit the Isolation Forest model
-        m = IForest()
+        m = ECOD()
         m.fit(X)
         
         # Predict outliers: In PyOD, typically 1 indicates an outlier and 0 an inlier.
@@ -241,7 +255,9 @@ class Model:
         
         # Identify indices of outliers
         outlier_indices = np.where(labels == 1)[0]
-        results = set(map(lambda i: str(self.slice.values[i][0]), outlier_indices)) #TODO: implement something beter than first element on list
+        values_array = self.slice.astype(str).values
+        # Use numpy's advanced indexing to get the first element of each desired row
+        results = set(values_array[outlier_indices, 0]) #TODO: implement something beter than first element on list
         return results
 
 def main():
@@ -295,6 +311,7 @@ def main():
 
     # Preprocessing
     df = get_dataframe(data)
+    model.filename = datetime.now().strftime("%Y-%m-%d.%H.%M.%S") + ".csv"
     #df.set_index("@timestamp", inplace=True)
     headers = df.columns.values.tolist()
     headers.remove("@timestamp")

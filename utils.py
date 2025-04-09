@@ -1,4 +1,5 @@
 import json
+import ast
 from collections import defaultdict
 from datetime import datetime
 import logging
@@ -33,12 +34,16 @@ def log_transform(series: pd.Series) -> np.ndarray:
 
 
 def float_transform(series: pd.Series) -> np.ndarray:
-    """
-    Convert a series to floats and return a 2D array.
-    Non-numeric values are coerced to NaN and replaced with 0.0.
-    """
-    numeric_series = pd.to_numeric(series, errors='coerce').fillna(0.0).astype(float)
-    return numeric_series.values.reshape(-1, 1)
+    # Convert series to numeric and fill missing values with the series mean.
+    numeric_series = pd.to_numeric(series, errors='coerce').astype(float).fillna(series.mean())
+    min_val = numeric_series.min()
+    max_val = numeric_series.max()
+    range_val = max_val - min_val
+    # Avoid division by zero: if range is 0, use 1 as the divisor.
+    if range_val == 0:
+        range_val = 1.0
+    transformed = (numeric_series - min_val) / range_val
+    return transformed.values.reshape(-1, 1)
 
 def frequency_transform(series: pd.Series) -> np.ndarray:
     """
@@ -54,25 +59,39 @@ def frequency_transform(series: pd.Series) -> np.ndarray:
     return result.reshape(-1, 1)
 
 def string_transform(series: pd.Series, maxN=30) -> np.ndarray:
-    n = len(series.value_counts())
-    if n > maxN: n = maxN
-    enc = StringEncoder(n_components=n)
-    series = series.fillna("").astype(str)
-    result = enc.fit_transform(series).values
+    # Replace missing values with a distinct marker.
+    filled_series = series.fillna("none").astype(str)
+    unique_values = filled_series.value_counts()
+    n_unique = len(unique_values)
+    
+    # If there's less than two unique values, return a constant array.
+    if n_unique < 2:
+        return np.zeros((len(series), 1))
+    
+    # Limit the number of components to the lesser of maxN or the number of unique values.
+    n_components = min(n_unique, maxN)
+    enc = StringEncoder(n_components=n_components)
+    
+    # Suppress warnings from catastrophic cancellation and invalid operations.
+
+    result = enc.fit_transform(filled_series).values
+    result = np.nan_to_num(result)
+
     return result
 
-def bagging_transform(df: pd.DataFrame, bucket_size='5s') -> np.ndarray:
+def bucket_transform(df: pd.DataFrame, bucket_size='5s') -> np.ndarray:
     # Ensure the DataFrame is indexed with a datetime index.
     # Group by time bucket and the single column's values, then count occurrences.
     pivot_df = df.groupby([pd.Grouper(freq=bucket_size), df]).size().unstack(fill_value=0)
     return pivot_df.values.astype(float)
 
-def count_vectorizer_transform(series: pd.Series) -> np.ndarray:
+def count_vectorizer_transform(series: pd.Series, max_features=1000) -> np.ndarray:
     # Ensure the series values are strings.
+    series.fillna("").astype(str)
     text_data = series.astype(str)
     
     # Initialize CountVectorizer with a token pattern that matches words with 4 or more characters.
-    vectorizer = CountVectorizer(token_pattern=r"(?u)\b\w{4,}\b")
+    vectorizer = CountVectorizer(token_pattern=r"(?u)\b[^=;+\:,&\s]{4,}\b",max_features=max_features)
     
     # Transform the text data to a document-term matrix.
     dt_matrix = vectorizer.fit_transform(text_data)
@@ -117,6 +136,39 @@ def get_dataframe(docs):
     df = pd.DataFrame(flattened_records)
     df["@timestamp"] = pd.to_datetime(df["@timestamp"], errors="coerce")
     return(df)
+
+def compute_accuracy(df,col,labels,filters):
+    if not filters:
+        return
+    key = filters[0]["key"]
+    assert key == col
+    combined = []
+    for f in filters:
+        #get statistics of df[labels] for a subset of rows where df[col] has values from f["value"]  
+        combined.append(f["value"])
+        subset = df[df[col].astype(str) == f["value"]]
+        metrics = subset[labels].value_counts() / len(subset) 
+        res = metrics.to_string().replace("\n","=")
+        res2 = subset[labels].value_counts().to_string().replace("\n","  =")
+        print(f"TEST: filter {f['key']}:{f['value']} > returned [*100%] {res} [in subset] {res2}")
+
+    subset = df[df[col].astype(str).isin(combined)]
+    metrics = subset[labels].value_counts() / len(subset) # how much returned results are 
+    res = metrics.to_string().replace("\n"," ")
+    total_counts = df[labels].value_counts()
+    matches_counts = subset[labels].value_counts()
+    # Create a new DataFrame that contains both sets of counts
+    total = pd.DataFrame({
+        "total": total_counts,
+        "matches": matches_counts
+    })
+    total = total.fillna(0)
+    tres = ""
+    for index, row in total.iterrows():
+        tres += f"{str(index)}: {str(row['matches'])} out of {str(row['total'])} ({str(row['matches'] / row['total']*100)})%; "
+    print(f"TEST: COMBINED filters for: {col} returned: {res}, RESULTING IN: {tres}")
+         
+
 
 def compute_entropy(series):
     #Shannon entropy of a pandas Series.
